@@ -6,6 +6,7 @@ import (
   "github.com/gin-gonic/gin"
   "github.com/google/uuid"
   "slices"
+  "time"
 )
 
 // Nasledujúci kód je kópiou vygenerovaného a zakomentovaného kódu zo súboru api_ambulance_waiting_list.go

@@ -29,7 +29,10 @@ switch ($command) {
     "openapi" {
         docker run --rm -ti -v ${ProjectRoot}:/local openapitools/openapi-generator-cli generate -c /local/scripts/generator-cfg.yaml
     }
-     "mongo" {
+    "test" {
+        go test -v ./...
+    }
+    "mongo" {
     mongo up
     }
     default {
