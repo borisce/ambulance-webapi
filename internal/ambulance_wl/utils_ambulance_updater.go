@@ -1,12 +1,39 @@
 package ambulance_wl
 
 import (
+    "fmt"
+    "log"
     "net/http"
+    "time"
+    "context"
 
     "github.com/gin-gonic/gin"
     "github.com/borisce/ambulance-webapi/internal/db_service"
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/attribute"
+    "go.opentelemetry.io/otel/metric"
+    
+)
+var (
+    dbMeter           = otel.Meter("waiting_list_access")
+    dbTimeSpent       metric.Float64Counter
+    waitingListLength = map[string]int64{}
 )
 
+// package initialization - called automaticaly by go runtime when package is used
+func init() {
+    // initialize OpenTelemetry instrumentations
+    var err error
+    dbTimeSpent, err = dbMeter.Float64Counter(
+        "ambulance_wl_time_spent_in_db",
+        metric.WithDescription("The time spent in the database requests"),
+        metric.WithUnit("ms"),
+    )
+
+    if err != nil {
+        panic(err)
+    }
+}
 type ambulanceUpdater = func(
     ctx *gin.Context,
     ambulance *Ambulance,
@@ -39,7 +66,13 @@ func updateAmbulanceFunc(ctx *gin.Context, updater ambulanceUpdater) {
 
     ambulanceId := ctx.Param("ambulanceId")
 
+    start := time.Now()
     ambulance, err := db.FindDocument(ctx, ambulanceId)
+    dbTimeSpent.Add(ctx, float64(float64(time.Since(start)))/float64(time.Millisecond), metric.WithAttributes(
+        attribute.String("operation", "find"),
+        attribute.String("ambulance_id", ambulanceId),
+        attribute.String("ambulance_name", ambulance.Name),
+    ))
 
     switch err {
     case nil:
@@ -79,7 +112,44 @@ func updateAmbulanceFunc(ctx *gin.Context, updater ambulanceUpdater) {
     updatedAmbulance, responseObject, status := updater(ctx, ambulance)
 
     if updatedAmbulance != nil {
+        start := time.Now()
         err = db.UpdateDocument(ctx, ambulanceId, updatedAmbulance)
+        // update metrics
+        dbTimeSpent.Add(ctx, float64(float64(time.Since(start)))/float64(time.Millisecond), metric.WithAttributes(
+            attribute.String("operation", "update"),
+            attribute.String("ambulance_id", ambulanceId),
+            attribute.String("ambulance_name", ambulance.Name),
+        ))
+
+        // demonstration of possible handling of async instruments:
+        // not really an operational metric, it would be more of a business metric/KPI.
+        // also UpDownCounter may be of better use in practical cases.
+        if _, ok := waitingListLength[ambulanceId]; !ok {
+            newGauge, err := dbMeter.Int64ObservableGauge(
+                fmt.Sprintf("%v_waiting_patients", ambulanceId),
+                metric.WithDescription(fmt.Sprintf("The length of the waiting list for the ambulance %v", ambulance.Name)),
+                metric.WithUnit("{patient}"),
+            )
+            if err != nil {
+                log.Printf("Failed to create waiting list length gauge for ambulance %v: %v", ambulanceId, err)
+            }
+            waitingListLength[ambulanceId] = 0
+
+            _, err = dbMeter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+                // we could have looked up the ambulance in the database here, but we already have it in memory
+                // so use the latest snapshots to update the gauge
+                o.ObserveInt64(newGauge, waitingListLength[ambulanceId])
+                return nil
+            }, newGauge)
+
+            if err != nil {
+                log.Printf("Failed to register callback for waiting list length gauge for ambulance %v: %v", ambulanceId, err)
+            }
+        }
+
+        // set the gauge snapshot
+        waitingListLength[ambulanceId] = int64(len(updatedAmbulance.WaitingList))
+        
     } else {
         err = nil // redundant but for clarity
     }
